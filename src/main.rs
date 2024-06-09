@@ -22,106 +22,114 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
 };
 
-// WebSocket连接
+#[derive(Parser, Debug)]
+#[clap(author, version, about, long_about = None)]
+struct Args {
+    /// Room ID to connect to
+    #[clap(short, long)]
+    room_id: u64,
+}
+
+#[tokio::main]
+async fn main() {
+    env_logger::init();
+    debug!("Starting application");
+    let args = Args::parse();
+    connect_websocket(args.room_id).await;
+}
+
 async fn connect_websocket(room_id: u64) {
     let client = Client::new();
-    let cookie_str = "";
-    unimplemented!("复制你的b站cookie到上面这个变量");
+    let cookie_str = ""; // Replace with actual cookie
     let mut headers = HeaderMap::new();
     headers.insert(COOKIE, HeaderValue::from_str(&cookie_str).unwrap());
+
     let url = format!(
         "https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?id={room_id}&type=0",
     );
-    info!("url: {url}");
-    let response = client
-        .get(url)
-        .headers(headers)
-        .send()
-        .await
-        .unwrap()
-        .json::<Value>()
-        .await
-        .unwrap();
-    let host = &response["data"]["host_list"][0]["host"];
-    let port = &response["data"]["host_list"][0]["wss_port"];
-    let token = &response["data"]["token"];
+    info!("Request URL: {url}");
 
-    info!(
-        "host: {}, port: {}, token: {}",
-        host.as_str().unwrap(),
-        port.as_u64().unwrap(),
-        // token.as_str().unwrap()
-        token
-    );
-    let url = format!(
-        "wss://{}:{}/sub",
-        host.as_str().unwrap(),
-        port.as_u64().unwrap()
-    );
-    info!("url: {}", url);
-    match connect_async(Uri::from_str(&url).unwrap()).await {
+    let response = match client.get(&url).headers(headers).send().await {
+        Ok(res) => res.json::<Value>().await.unwrap(),
+        Err(e) => {
+            error!("Failed to get response: {}", e);
+            return;
+        }
+    };
+
+    let host = response["data"]["host_list"][0]["host"].as_str().unwrap();
+    let port = response["data"]["host_list"][0]["wss_port"]
+        .as_u64()
+        .unwrap();
+    let token = response["data"]["token"].as_str().unwrap();
+
+    info!("Host: {}, Port: {}, Token: {}", host, port, token);
+    let ws_url = format!("wss://{}:{}/sub", host, port);
+    info!("WebSocket URL: {}", ws_url);
+
+    match connect_async(Uri::from_str(&ws_url).unwrap()).await {
         Ok((ws_stream, _)) => {
-            info!("success to connect wss server: {}", url);
+            info!("Connected to WebSocket server: {}", ws_url);
             let (mut write, mut read) = ws_stream.split();
-            // 发送认证信息
-            debug!("ready to send auth packet");
-            let auth = json!(
-                {
+
+            let auth_payload = json!({
                 "uid": 102624818,
                 "roomid": room_id,
                 "protover": 3,
-                // "buvid": "4AF0ACD7-9551-A8C0-A266-3008F272EE8833116infoc".to_string(),
                 "buvid": "",
                 "platform": "web",
                 "type": 2,
                 "key": token
             });
-            let payload = serde_json::to_string(&auth).unwrap();
-            send_packet(&mut write, 7, &payload.as_bytes()).await;
-            debug!("auth packet sent");
-            // 心跳逻辑可以在这里添加
+
+            send_packet(&mut write, 7, &serde_json::to_vec(&auth_payload).unwrap()).await;
+            debug!("Auth packet sent");
+
             let heartbeat_task = tokio::spawn(async move {
                 loop {
                     send_heartbeat_packet(&mut write).await;
                     tokio::time::sleep(Duration::from_secs(30)).await;
                 }
             });
-            let mut totalcounter: u32 = 0;
+
             let counter = Arc::new(Mutex::new(0 as u32));
             let counter_clone = counter.clone();
             let recv_task = tokio::spawn(async move {
-                let mut pending_data: Vec<u8> = vec![];
-                let exist_id_str: Arc<Mutex<VecDeque<String>>> =
-                    Arc::new(Mutex::new(VecDeque::new()));
+                let mut peinding_binary_data = vec![];
+                let exist_id_str = Arc::new(Mutex::new(VecDeque::new()));
+
                 while let Some(msg) = read.next().await {
                     match msg {
                         Ok(Message::Binary(mut bin)) => {
-                            debug!("recv binary data");
-                            pending_data.append(&mut bin);
-                            handle_binary_message(&mut pending_data, &exist_id_str, &counter_clone)
-                                .await;
+                            debug!("Received binary data");
+                            peinding_binary_data.append(&mut bin);
+                            handle_binary_message(
+                                &mut peinding_binary_data,
+                                &exist_id_str,
+                                &counter_clone,
+                            );
+                            debug!("pending_binary_data size: {:?}", peinding_binary_data.len());
                         }
                         Ok(Message::Text(text)) => {
-                            info!("recv text data: {}", text);
+                            info!("Received text data: {}", text);
                         }
                         Err(e) => {
                             error!("Error receiving message: {}", e);
                         }
                         _ => {
-                            info!("other message type: {msg:?}");
+                            debug!("Unhandled websocket message type: {:?}", msg);
                         }
                     }
                 }
             });
-            let counter_thread_clone = counter.clone();
+
             let counter_task = std::thread::spawn(move || loop {
-                std::thread::sleep(Duration::from_millis(1000));
-                let mut current_counter = counter_thread_clone.lock().unwrap();
-                totalcounter += *current_counter;
-                info!("====== 每秒弹幕数目: {}", current_counter);
-                info!("======= 总弹幕数目: {totalcounter}");
+                std::thread::sleep(Duration::from_secs(1));
+                let mut current_counter = counter.lock().unwrap();
+                info!("Messages per second: {}", *current_counter);
                 *current_counter = 0;
             });
+
             let _ = tokio::join!(heartbeat_task, recv_task);
             let _ = counter_task.join();
         }
@@ -131,7 +139,6 @@ async fn connect_websocket(room_id: u64) {
     }
 }
 
-// 发送二进制数据包
 async fn send_packet(
     write: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
     op: u32,
@@ -156,7 +163,6 @@ async fn send_packet(
     }
 }
 
-// 发送心跳包
 async fn send_heartbeat_packet(
     write: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
 ) {
@@ -165,173 +171,120 @@ async fn send_heartbeat_packet(
     debug!("Sent heartbeat packet");
 }
 
-// 处理解码后的二进制消息
-async fn handle_binary_message(
+fn handle_binary_message(
     bin: &mut Vec<u8>,
     existed_id_str: &Arc<Mutex<VecDeque<String>>>,
     counter: &Arc<Mutex<u32>>,
 ) {
-    // 获取协议版本
     let mut pos = 0;
     while pos < bin.len() {
-        let packet_size =
-            u32::from_be_bytes([bin[pos + 0], bin[pos + 1], bin[pos + 2], bin[pos + 3]]);
-        debug!("check packet_size: {packet_size} , pos: {pos} , bin[0]: {}, bin[1]: {}, bin[2]: {},  bin[3]: {}",bin[pos + 0],bin[pos+1],bin[pos+2],bin[pos+3]);
+        debug!("pos: {pos}, bin size: {}", bin.len());
+        let packet_size = u32::from_be_bytes([bin[pos], bin[pos + 1], bin[pos + 2], bin[pos + 3]]);
         if (packet_size as usize + pos) > bin.len() {
-            debug!(
-                "need size: {} , bin.len: {}",
-                packet_size as usize + pos,
-                bin.len()
-            );
             bin.drain(..pos);
-            debug!("need more data");
-            break;
+            return;
         }
         let proto_ver = u16::from_be_bytes([bin[pos + 6], bin[pos + 7]]);
-
-        // 根据协议版本选择处理逻辑
         match proto_ver {
             0 | 1 => {
-                // 无压缩或非Brotli压缩，这里假设直接是JSON，简化处理
-                let message_type = u32::from_be_bytes(bin[pos + 8..pos + 12].try_into().unwrap());
-                debug!("message_type: {message_type}");
-                match message_type {
-                    3 => {
-                        debug!(
-                            "瞎整的心跳回复包应该的位置: {}",
-                            pos + packet_size as usize + 4
-                        );
-                        if bin.len() >= pos + packet_size as usize + 4 {
-                            pos += packet_size as usize + 4;
-                            debug!("Heartbeat response received , 🐶陈睿故意瞎整协议是吧.");
-                            continue;
-                        } else {
-                            debug!("need more data for heartbeat response");
-                            bin.drain(..pos);
-                            break;
-                        }
-                    }
-                    5 => {
-                        let bin_slice = &bin[pos..(pos + packet_size as usize)];
-                        debug!(
-                            "pos: {pos} , packet_size: {packet_size} ,  bin_slice: {bin_slice:?}"
-                        );
-                        // 假设其他操作是JSON数据
-                        let bin_data = bin[(pos + 16)..(pos + packet_size as usize)].to_vec();
-                        let json_str = String::from_utf8(bin_data.clone()).unwrap();
-                        let json = serde_json::from_str::<Value>(&json_str);
-                        match json {
-                            Ok(json_success) => {
-                                if let Some(cmd_type) = json_success["cmd"].as_str() {
-                                    match cmd_type {
-                                        "WATCHED_CHANGE" => {
-                                            debug!(
-                                                "看过的人数: {}",
-                                                json_success["data"]["num"].as_u64().unwrap()
-                                            );
-                                        }
-                                        "ONLINE_RANK_V2" => {}
-                                        "DANMU_MSG" => {
-                                            debug!(
-                                                "json content: {json_str} , header: {:?}",
-                                                &bin[pos..(pos + 16)]
-                                            );
-                                            let dm_sender =
-                                                json_success["info"][2][1].as_str().unwrap();
-                                            let dm_message =
-                                                json_success["info"][1].as_str().unwrap();
-
-                                            if let Some(extra_json_str) =
-                                                json_success["info"][0][15]["extra"].as_str()
-                                            {
-                                                if let Ok(extra_json) =
-                                                    serde_json::from_str::<Value>(extra_json_str)
-                                                {
-                                                    let id_str =
-                                                        extra_json["id_str"].as_str().unwrap();
-                                                    debug!("id_str: {id_str}");
-                                                    let mut exist_id_str_obj =
-                                                        existed_id_str.lock().unwrap();
-                                                    if exist_id_str_obj.contains(&id_str.into()) {
-                                                        debug!(
-                                                            "existed id_str, existed_id_str: {:?}",
-                                                            exist_id_str_obj
-                                                        );
-                                                    } else {
-                                                        exist_id_str_obj.push_back(id_str.into());
-                                                        info!(
-                                                            "弹幕, {dm_sender} 说:  {dm_message}"
-                                                        );
-                                                        if exist_id_str_obj.len() > 10000 {
-                                                            exist_id_str_obj.pop_front();
-                                                        }
-                                                        let mut current_counter =
-                                                            counter.lock().unwrap();
-                                                        *current_counter += 1;
-                                                    }
-                                                    pos += packet_size as usize;
-                                                    continue;
-                                                }
-                                            }
-
-                                            info!("弹幕, {dm_sender} 说:  {dm_message}");
-                                        }
-                                        _ => {
-                                            debug!("不感兴趣的message type: {}", cmd_type);
-                                        }
-                                    }
-                                }
-                            }
-                            Err(_) => debug!("not json data: {:?}", json_str),
-                        }
-                    }
-                    _ => {
-                        debug!("不感兴趣的消息类型")
-                    }
-                }
+                handle_uncompressed_message(bin, &mut pos, packet_size, existed_id_str, counter);
             }
             3 => {
-                // Brotli解压
-                let mut decompressor = Decompressor::new(
-                    Cursor::new(&bin[(pos + 16)..(pos + packet_size as usize)]),
-                    1024 * 1024,
-                );
-                let mut decoded_data = Vec::new();
-                match decompressor.read_to_end(&mut decoded_data) {
-                    Ok(_) => {
-                        // let mut ttt = existed_id_str.clone();
-                        // 解压成功，递归处理解压后的数据
-                        Box::pin(async move {
-                            handle_binary_message(&mut decoded_data, existed_id_str, counter).await;
-                        })
-                        .await;
-                    }
-                    Err(e) => {
-                        error!("Brotli decompression error: {}", e);
-                    }
-                }
+                handle_compressed_message(bin, &mut pos, packet_size, existed_id_str, counter);
             }
-            _ => {
-                error!("Unsupported protocol version: {}", proto_ver);
-            }
+            _ => error!("Unsupported protocol version: {}", proto_ver),
         }
-        pos += packet_size as usize;
-        debug!("after parse message, pos: {pos} , packet_size: {packet_size}");
+    }
+    debug!("pos: {pos}");
+    bin.drain(..pos);
+}
+
+fn handle_uncompressed_message(
+    bin: &mut Vec<u8>,
+    pos: &mut usize,
+    packet_size: u32,
+    existed_id_str: &Arc<Mutex<VecDeque<String>>>,
+    counter: &Arc<Mutex<u32>>,
+) {
+    debug!("Uncompressed message");
+    debug!(
+        "Received response, pos: {pos}, packet size: {packet_size}, bin: {:?}",
+        &bin[(*pos)..]
+    );
+    let message_type = u32::from_be_bytes(bin[(*pos + 8)..(*pos + 12)].try_into().unwrap());
+    match message_type {
+        3 => {
+            *pos += packet_size as usize + 4;
+        }
+        5 => {
+            debug!("Received danmu message");
+            let bin_data = bin[(*pos + 16)..(*pos + packet_size as usize)].to_vec();
+            let json_str = String::from_utf8(bin_data).unwrap();
+            if let Ok(json) = serde_json::from_str::<Value>(&json_str) {
+                handle_danmu_message(&json, existed_id_str, counter);
+            }
+            *pos += packet_size as usize;
+        }
+        _ => {
+            debug!("Unhandled message type: {}", message_type);
+            *pos += packet_size as usize;
+        }
     }
 }
 
-#[derive(Parser, Debug)]
-#[clap(author, version, about, long_about = None)]
-struct Args {
-    /// Room ID to connect to
-    #[clap(short, long)]
-    room_id: u64,
+fn handle_compressed_message(
+    bin: &mut Vec<u8>,
+    pos: &mut usize,
+    packet_size: u32,
+    existed_id_str: &Arc<Mutex<VecDeque<String>>>,
+    counter: &Arc<Mutex<u32>>,
+) {
+    debug!("handle_compressed_message");
+    let mut decompressor = Decompressor::new(
+        Cursor::new(&bin[(*pos + 16)..(*pos + packet_size as usize)]),
+        1024 * 1024,
+    );
+    let mut decoded_data = Vec::new();
+    match decompressor.read_to_end(&mut decoded_data) {
+        Ok(_) => {
+            *pos += packet_size as usize;
+            // bin.append(&mut decoded_data);
+            // let mut uncompressed_binary_data: Vec<u8> = bin[(*pos)..].to_vec();
+            handle_binary_message(&mut decoded_data, existed_id_str, counter);
+            if decoded_data.len() > 0 {
+                bin.append(&mut decoded_data);
+            }
+        }
+        Err(e) => {
+            error!("Brotli decompression error: {}", e);
+        }
+    }
 }
 
-#[tokio::main]
-async fn main() {
-    env_logger::init();
-    debug!("ready to start");
-    let args = Args::parse();
-    connect_websocket(args.room_id).await;
+fn handle_danmu_message(
+    json: &Value,
+    existed_id_str: &Arc<Mutex<VecDeque<String>>>,
+    counter: &Arc<Mutex<u32>>,
+) {
+    debug!("handle_danmu_message");
+    if json["cmd"] == "DANMU_MSG" {
+        let info = &json["info"];
+        let msg = info[1].as_str().unwrap();
+        let user_name = &info[2][1].as_str().unwrap();
+        let messageid = &info[0][15]["extra"].as_str().unwrap().to_string();
+        let mut existed_id_str = existed_id_str.lock().unwrap();
+        if existed_id_str.contains(&messageid) {
+            debug!("Duplicated message from user ID: {}", messageid);
+            return;
+        }
+        if existed_id_str.len() > 30 {
+            existed_id_str.pop_front();
+        }
+        existed_id_str.push_back(messageid.clone());
+
+        let mut counter = counter.lock().unwrap();
+        *counter += 1;
+
+        println!("{}: {}", user_name, msg);
+    }
 }
