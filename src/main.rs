@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{value_parser, Parser};
 use log::{debug, error, info};
 use reqwest::{
     header::{HeaderMap, HeaderValue, COOKIE},
@@ -7,6 +7,7 @@ use reqwest::{
 use serde_json::{json, Value};
 use std::{
     collections::VecDeque,
+    fs,
     io::{Cursor, Read},
     str::FromStr,
     sync::{Arc, Mutex},
@@ -28,6 +29,8 @@ struct Args {
     /// Room ID to connect to
     #[clap(short, long)]
     room_id: u64,
+    #[clap(short, long)]
+    cookie_file: Option<String>,
 }
 
 #[tokio::main]
@@ -35,14 +38,17 @@ async fn main() {
     env_logger::init();
     debug!("Starting application");
     let args = Args::parse();
-    connect_websocket(args.room_id).await;
+    let mut cookie_file =
+        fs::File::open(args.cookie_file.unwrap_or_else(|| "cookie.txt".into())).unwrap();
+    let mut cookie_content: String = "".into();
+    let _ = cookie_file.read_to_string(&mut cookie_content);
+    connect_websocket(args.room_id, &cookie_content).await;
 }
 
-async fn connect_websocket(room_id: u64) {
+async fn connect_websocket(room_id: u64, cookie_content: &String) {
     let client = Client::new();
-    let cookie_str = ""; // Replace with actual cookie
     let mut headers = HeaderMap::new();
-    headers.insert(COOKIE, HeaderValue::from_str(&cookie_str).unwrap());
+    headers.insert(COOKIE, HeaderValue::from_str(cookie_content).unwrap());
 
     let url = format!(
         "https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?id={room_id}&type=0",
@@ -93,7 +99,10 @@ async fn connect_websocket(room_id: u64) {
             });
 
             let counter = Arc::new(Mutex::new(0 as u32));
-            let counter_clone = counter.clone();
+            let total_counter = Arc::new(Mutex::new(0 as u64));
+            let mps = Arc::new(Mutex::new(0 as u32));
+
+            let counter_recv_clone = counter.clone();
             let recv_task = tokio::spawn(async move {
                 let mut peinding_binary_data = vec![];
                 let exist_id_str = Arc::new(Mutex::new(VecDeque::new()));
@@ -106,7 +115,7 @@ async fn connect_websocket(room_id: u64) {
                             handle_binary_message(
                                 &mut peinding_binary_data,
                                 &exist_id_str,
-                                &counter_clone,
+                                &counter_recv_clone,
                             );
                             debug!("pending_binary_data size: {:?}", peinding_binary_data.len());
                         }
@@ -122,15 +131,36 @@ async fn connect_websocket(room_id: u64) {
                     }
                 }
             });
-
-            let counter_task = std::thread::spawn(move || loop {
-                std::thread::sleep(Duration::from_secs(1));
-                let mut current_counter = counter.lock().unwrap();
-                info!("Messages per second: {}", *current_counter);
-                *current_counter = 0;
+            let mps_clone_output = mps.clone();
+            let total_counter_clone_output = total_counter.clone();
+            let input_task = tokio::spawn(async move {
+                loop {
+                    // if press s then info message count per second and total message count
+                    if std::io::stdin().lock().bytes().next().unwrap().unwrap() == b's' {
+                        let mps = mps_clone_output.lock().unwrap();
+                        let total_counter = total_counter_clone_output.lock().unwrap();
+                        info!(
+                            "Messages per second: {}, total message count: {}",
+                            *mps, *total_counter
+                        );
+                    }
+                }
             });
 
-            let _ = tokio::join!(heartbeat_task, recv_task);
+            let counter_clone_statistic = counter.clone();
+            let total_counter_clone_statistic = total_counter.clone();
+            let mps_clone_statistic = mps.clone();
+            let counter_task = std::thread::spawn(move || loop {
+                std::thread::sleep(Duration::from_secs(1));
+                let mut counter = counter_clone_statistic.lock().unwrap();
+                let mut total_counter = total_counter_clone_statistic.lock().unwrap();
+                let mut mps = mps_clone_statistic.lock().unwrap();
+                *mps = *counter as u32;
+                *total_counter += *counter as u64;
+                *counter = 0;
+            });
+
+            let _ = tokio::join!(heartbeat_task, recv_task, input_task);
             let _ = counter_task.join();
         }
         Err(e) => {
@@ -248,8 +278,6 @@ fn handle_compressed_message(
     match decompressor.read_to_end(&mut decoded_data) {
         Ok(_) => {
             *pos += packet_size as usize;
-            // bin.append(&mut decoded_data);
-            // let mut uncompressed_binary_data: Vec<u8> = bin[(*pos)..].to_vec();
             handle_binary_message(&mut decoded_data, existed_id_str, counter);
             if decoded_data.len() > 0 {
                 bin.append(&mut decoded_data);
