@@ -1,4 +1,4 @@
-use clap::{value_parser, Parser};
+use clap::Parser;
 use log::{debug, error, info};
 use reqwest::{
     header::{HeaderMap, HeaderValue, COOKIE},
@@ -42,6 +42,7 @@ async fn main() {
         fs::File::open(args.cookie_file.unwrap_or_else(|| "cookie.txt".into())).unwrap();
     let mut cookie_content: String = "".into();
     let _ = cookie_file.read_to_string(&mut cookie_content);
+    info!("cookie_content: {cookie_content}");
     connect_websocket(args.room_id, &cookie_content).await;
 }
 
