@@ -140,7 +140,7 @@ async fn connect_websocket(room_id: u64, cookie_content: &String) {
                     if std::io::stdin().lock().bytes().next().unwrap().unwrap() == b's' {
                         let mps = mps_clone_output.lock().unwrap();
                         let total_counter = total_counter_clone_output.lock().unwrap();
-                        info!(
+                        println!(
                             "Messages per second: {}, total message count: {}",
                             *mps, *total_counter
                         );
@@ -246,11 +246,12 @@ fn handle_uncompressed_message(
     match message_type {
         3 => {
             *pos += packet_size as usize + 4;
+            info!("🐶陈睿，故意多搞4个字节是吧");
         }
         5 => {
-            debug!("Received danmu message");
             let bin_data = bin[(*pos + 16)..(*pos + packet_size as usize)].to_vec();
             let json_str = String::from_utf8(bin_data).unwrap();
+            debug!("Received danmu message: {json_str}");
             if let Ok(json) = serde_json::from_str::<Value>(&json_str) {
                 handle_danmu_message(&json, existed_id_str, counter);
             }
@@ -298,9 +299,17 @@ fn handle_danmu_message(
     debug!("handle_danmu_message");
     if json["cmd"] == "DANMU_MSG" {
         let info = &json["info"];
-        let msg = info[1].as_str().unwrap();
         let user_name = &info[2][1].as_str().unwrap();
-        let messageid = &info[0][15]["extra"].as_str().unwrap().to_string();
+        let message_detail_str = &info[0][15]["extra"].as_str().unwrap().to_string();
+        let message_detail_json = serde_json::from_str::<Value>(&message_detail_str).unwrap();
+        let messageid = message_detail_json["id_str"].as_str().unwrap().to_string();
+        let mut message = message_detail_json["content"].as_str().unwrap().to_string();
+        let reply_to = message_detail_json["reply_uname"].as_str().unwrap();
+        if !reply_to.is_empty() {
+            message = format!("{} 回复 {}：{}", user_name, reply_to, message);
+        } else {
+            message = format!("{} ：{}", user_name, message);
+        }
         let mut existed_id_str = existed_id_str.lock().unwrap();
         if existed_id_str.contains(&messageid) {
             debug!("Duplicated message from user ID: {}", messageid);
@@ -314,6 +323,8 @@ fn handle_danmu_message(
         let mut counter = counter.lock().unwrap();
         *counter += 1;
 
-        println!("{}: {}", user_name, msg);
+        println!("{}", message);
+    } else {
+        info!("unhandle danmu message: {}", json);
     }
 }
