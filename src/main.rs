@@ -1,4 +1,5 @@
 use clap::Parser;
+use lazy_static::lazy_static;
 use log::{debug, error, info};
 use reqwest::{
     header::{HeaderMap, HeaderValue, COOKIE},
@@ -22,6 +23,14 @@ use tokio_tungstenite::{
     tungstenite::{http::Uri, Message},
     MaybeTlsStream, WebSocketStream,
 };
+
+lazy_static! {
+    static ref EXIST_DANMU_ID_STR: Arc<Mutex<VecDeque<String>>> =
+        Arc::new(Mutex::new(VecDeque::<String>::new()));
+    static ref DANMU_PER_SECOND: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+    static ref DANMU_PER_SECOND_COUNTER: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+    static ref DANMU_TOTAL_COUNTER: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+}
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -99,25 +108,15 @@ async fn connect_websocket(room_id: u64, cookie_content: &String) {
                 }
             });
 
-            let counter = Arc::new(Mutex::new(0 as u32));
-            let total_counter = Arc::new(Mutex::new(0 as u64));
-            let mps = Arc::new(Mutex::new(0 as u32));
-
-            let counter_recv_clone = counter.clone();
             let recv_task = tokio::spawn(async move {
                 let mut peinding_binary_data = vec![];
-                let exist_id_str = Arc::new(Mutex::new(VecDeque::new()));
 
                 while let Some(msg) = read.next().await {
                     match msg {
                         Ok(Message::Binary(mut bin)) => {
                             debug!("Received binary data");
                             peinding_binary_data.append(&mut bin);
-                            handle_binary_message(
-                                &mut peinding_binary_data,
-                                &exist_id_str,
-                                &counter_recv_clone,
-                            );
+                            handle_binary_message(&mut peinding_binary_data);
                             debug!("pending_binary_data size: {:?}", peinding_binary_data.len());
                         }
                         Ok(Message::Text(text)) => {
@@ -132,14 +131,13 @@ async fn connect_websocket(room_id: u64, cookie_content: &String) {
                     }
                 }
             });
-            let mps_clone_output = mps.clone();
-            let total_counter_clone_output = total_counter.clone();
+
             let input_task = tokio::spawn(async move {
                 loop {
                     // if press s then info message count per second and total message count
                     if std::io::stdin().lock().bytes().next().unwrap().unwrap() == b's' {
-                        let mps = mps_clone_output.lock().unwrap();
-                        let total_counter = total_counter_clone_output.lock().unwrap();
+                        let mps = DANMU_PER_SECOND.lock().unwrap();
+                        let total_counter = DANMU_TOTAL_COUNTER.lock().unwrap();
                         println!(
                             "Messages per second: {}, total message count: {}",
                             *mps, *total_counter
@@ -148,16 +146,13 @@ async fn connect_websocket(room_id: u64, cookie_content: &String) {
                 }
             });
 
-            let counter_clone_statistic = counter.clone();
-            let total_counter_clone_statistic = total_counter.clone();
-            let mps_clone_statistic = mps.clone();
             let counter_task = std::thread::spawn(move || loop {
                 std::thread::sleep(Duration::from_secs(1));
-                let mut counter = counter_clone_statistic.lock().unwrap();
-                let mut total_counter = total_counter_clone_statistic.lock().unwrap();
-                let mut mps = mps_clone_statistic.lock().unwrap();
-                *mps = *counter as u32;
-                *total_counter += *counter as u64;
+                let mut counter = DANMU_PER_SECOND_COUNTER.lock().unwrap();
+                let mut total_counter = DANMU_TOTAL_COUNTER.lock().unwrap();
+                let mut mps = DANMU_PER_SECOND.lock().unwrap();
+                *mps = *counter;
+                *total_counter += *counter;
                 *counter = 0;
             });
 
@@ -202,11 +197,7 @@ async fn send_heartbeat_packet(
     debug!("Sent heartbeat packet");
 }
 
-fn handle_binary_message(
-    bin: &mut Vec<u8>,
-    existed_id_str: &Arc<Mutex<VecDeque<String>>>,
-    counter: &Arc<Mutex<u32>>,
-) {
+fn handle_binary_message(bin: &mut Vec<u8>) {
     let mut pos = 0;
     while pos < bin.len() {
         debug!("pos: {pos}, bin size: {}", bin.len());
@@ -218,10 +209,10 @@ fn handle_binary_message(
         let proto_ver = u16::from_be_bytes([bin[pos + 6], bin[pos + 7]]);
         match proto_ver {
             0 | 1 => {
-                handle_uncompressed_message(bin, &mut pos, packet_size, existed_id_str, counter);
+                handle_uncompressed_message(bin, &mut pos, packet_size);
             }
             3 => {
-                handle_compressed_message(bin, &mut pos, packet_size, existed_id_str, counter);
+                handle_compressed_message(bin, &mut pos, packet_size);
             }
             _ => error!("Unsupported protocol version: {}", proto_ver),
         }
@@ -230,13 +221,7 @@ fn handle_binary_message(
     bin.drain(..pos);
 }
 
-fn handle_uncompressed_message(
-    bin: &mut Vec<u8>,
-    pos: &mut usize,
-    packet_size: u32,
-    existed_id_str: &Arc<Mutex<VecDeque<String>>>,
-    counter: &Arc<Mutex<u32>>,
-) {
+fn handle_uncompressed_message(bin: &mut Vec<u8>, pos: &mut usize, packet_size: u32) {
     debug!("Uncompressed message");
     debug!(
         "Received response, pos: {pos}, packet size: {packet_size}, bin: {:?}",
@@ -253,7 +238,7 @@ fn handle_uncompressed_message(
             let json_str = String::from_utf8(bin_data).unwrap();
             debug!("Received danmu message: {json_str}");
             if let Ok(json) = serde_json::from_str::<Value>(&json_str) {
-                handle_danmu_message(&json, existed_id_str, counter);
+                handle_danmu_message(&json);
             }
             *pos += packet_size as usize;
         }
@@ -264,13 +249,7 @@ fn handle_uncompressed_message(
     }
 }
 
-fn handle_compressed_message(
-    bin: &mut Vec<u8>,
-    pos: &mut usize,
-    packet_size: u32,
-    existed_id_str: &Arc<Mutex<VecDeque<String>>>,
-    counter: &Arc<Mutex<u32>>,
-) {
+fn handle_compressed_message(bin: &mut Vec<u8>, pos: &mut usize, packet_size: u32) {
     debug!("handle_compressed_message");
     let mut decompressor = Decompressor::new(
         Cursor::new(&bin[(*pos + 16)..(*pos + packet_size as usize)]),
@@ -280,7 +259,7 @@ fn handle_compressed_message(
     match decompressor.read_to_end(&mut decoded_data) {
         Ok(_) => {
             *pos += packet_size as usize;
-            handle_binary_message(&mut decoded_data, existed_id_str, counter);
+            handle_binary_message(&mut decoded_data);
             if decoded_data.len() > 0 {
                 bin.append(&mut decoded_data);
             }
@@ -291,11 +270,7 @@ fn handle_compressed_message(
     }
 }
 
-fn handle_danmu_message(
-    json: &Value,
-    existed_id_str: &Arc<Mutex<VecDeque<String>>>,
-    counter: &Arc<Mutex<u32>>,
-) {
+fn handle_danmu_message(json: &Value) {
     debug!("handle_danmu_message");
     if json["cmd"] == "DANMU_MSG" {
         let info = &json["info"];
@@ -310,7 +285,7 @@ fn handle_danmu_message(
         } else {
             message = format!("{} ：{}", user_name, message);
         }
-        let mut existed_id_str = existed_id_str.lock().unwrap();
+        let mut existed_id_str = EXIST_DANMU_ID_STR.lock().unwrap();
         if existed_id_str.contains(&messageid) {
             debug!("Duplicated message from user ID: {}", messageid);
             return;
@@ -320,7 +295,7 @@ fn handle_danmu_message(
         }
         existed_id_str.push_back(messageid.clone());
 
-        let mut counter = counter.lock().unwrap();
+        let mut counter = DANMU_PER_SECOND_COUNTER.lock().unwrap();
         *counter += 1;
 
         println!("{}", message);
